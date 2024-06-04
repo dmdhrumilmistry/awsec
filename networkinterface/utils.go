@@ -4,6 +4,8 @@ import (
 	"context"
 	"log"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 )
 
@@ -20,20 +22,6 @@ func DescribeSecurityGroups(svc *ec2.Client, sgIds []string) *ec2.DescribeSecuri
 	}
 
 	return sgResult
-
-	// for _, sg := range sgResult.SecurityGroups {
-	// 	fmt.Printf("  SecurityGroup: %s (%s)\n", aws.ToString(sg.GroupName), aws.ToString(sg.GroupId))
-	// 	fmt.Printf("    Description: %s\n", aws.ToString(sg.Description))
-	// 	fmt.Printf("    VPCId: %s\n", aws.ToString(sg.VpcId))
-
-	// 	for _, perm := range sg.IpPermissions {
-	// 		fmt.Printf("    Inbound Rule: %v\n", perm)
-	// 		perm.
-	// 	}
-	// 	for _, perm := range sg.IpPermissionsEgress {
-	// 		fmt.Printf("    Outbound Rule: %v\n", perm)
-	// 	}
-	// }
 }
 
 func GetOpenNetworkInterfaces(securityGroupOutput *ec2.DescribeSecurityGroupsOutput) (bool, []VulnNISG) {
@@ -67,7 +55,18 @@ func GetOpenNetworkInterfaces(securityGroupOutput *ec2.DescribeSecurityGroupsOut
 			}
 
 			// ipv6 vuln config
-
+			for _, ipRange := range ipPerms.Ipv6Ranges {
+				if *ipRange.CidrIpv6 == "::/0" {
+					isVulnSg = true
+					isNIVuln = true
+					vulnSg = append(vulnSg, VulnSGConfig{
+						Port:     *ipPerms.FromPort,
+						Cidr:     *ipRange.CidrIpv6,
+						Protocol: *ipPerms.IpProtocol,
+						IsV6:     true,
+					})
+				}
+			}
 		}
 
 		if isVulnSg {
@@ -82,4 +81,75 @@ func GetOpenNetworkInterfaces(securityGroupOutput *ec2.DescribeSecurityGroupsOut
 	}
 
 	return isNIVuln, vulnSgs
+}
+
+func GetOpenNetworkInterfacesForRegion(region string) []VulnNI {
+	// Load the Shared AWS Configuration (~/.aws/config)
+	cfg, err := config.LoadDefaultConfig(context.TODO(), config.WithRegion(region))
+	if err != nil {
+		log.Fatalf("unable to load SDK config, %v", err)
+	}
+
+	// Create an EC2 service client
+	svc := ec2.NewFromConfig(cfg)
+
+	// Describe network interfaces
+	input := &ec2.DescribeNetworkInterfacesInput{}
+	result, err := svc.DescribeNetworkInterfaces(context.TODO(), input)
+	if err != nil {
+		log.Fatalf("unable to describe network interfaces, %v", err)
+	}
+
+	// Filter and display the results
+	vulnNIs := []VulnNI{}
+	for _, ni := range result.NetworkInterfaces {
+		if ni.Association != nil && ni.Association.PublicIp != nil {
+
+			// Collect security group IDs
+			var sgIds []string
+			for _, sg := range ni.Groups {
+				sgIds = append(sgIds, aws.ToString(sg.GroupId))
+			}
+
+			if len(sgIds) <= 0 {
+				continue
+			}
+
+			// Describe the security groups
+			sgOutputs := DescribeSecurityGroups(svc, sgIds)
+			isVulnSg, vulnSGs := GetOpenNetworkInterfaces(sgOutputs)
+
+			if isVulnSg {
+				vulnNIs = append(vulnNIs, VulnNI{
+					ResourceId:       aws.ToString(ni.NetworkInterfaceId),
+					PublicIp:         aws.ToString(ni.Association.PublicIp),
+					AvailabilityZone: aws.ToString(ni.AvailabilityZone),
+					VulnNISGs:        vulnSGs,
+				})
+			}
+		}
+	}
+
+	return vulnNIs
+}
+
+func IpInBypassList(ip string, bypassIps []string) bool {
+	for _, bypassIP := range bypassIps {
+		if ip == bypassIP {
+			return true
+		}
+	}
+	return false
+}
+
+func FilterOpenNetworkInterfaces(vulnNIs []VulnNI, allowListIps []string) []VulnNI {
+	vulnNIsFiltered := []VulnNI{}
+
+	for _, vulnNi := range vulnNIs {
+		if !IpInBypassList(vulnNi.PublicIp, allowListIps) {
+			vulnNIsFiltered = append(vulnNIsFiltered, vulnNi)
+		}
+	}
+
+	return vulnNIsFiltered
 }
