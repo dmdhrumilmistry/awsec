@@ -1,65 +1,98 @@
 package main
 
 import (
-	"context"
-	"fmt"
+	"flag"
 	"log"
+	"sync"
 
-	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/config"
-	"github.com/aws/aws-sdk-go-v2/service/ec2"
-
+	"github.com/dmdhrumilmistry/awsec/config"
+	"github.com/dmdhrumilmistry/awsec/ec2"
 	"github.com/dmdhrumilmistry/awsec/networkinterface"
+	"github.com/dmdhrumilmistry/awsec/notif"
+	"github.com/dmdhrumilmistry/awsec/utils"
 )
 
 func main() {
-	// Load the Shared AWS Configuration (~/.aws/config)
-	cfg, err := config.LoadDefaultConfig(context.TODO(), config.WithRegion("ap-south-1"))
+
+	// Parse command line flags
+	var slackWebhook string
+	var bypassFilePath string
+	flag.StringVar(&slackWebhook, "sw", "", "Slack webhook URL")
+	flag.StringVar(&bypassFilePath, "bf", "", "Bypass file path")
+	flag.Parse()
+
+	// validate flags
+	sendNotification := false
+	if slackWebhook == "" {
+		log.Println("Slack Webhook Not Found!")
+	} else {
+		sendNotification = true
+	}
+
+	config, err := config.NewConfig("eu-west-2")
 	if err != nil {
 		log.Fatalf("unable to load SDK config, %v", err)
 	}
 
-	// Create an EC2 service client
-	svc := ec2.NewFromConfig(cfg)
+	regions := ec2.GetAllRegions(config)
 
-	fmt.Println("Listing all public IP addresses of EC2 instances in the region:")
-	// Describe network interfaces
-	input := &ec2.DescribeNetworkInterfacesInput{}
-	result, err := svc.DescribeNetworkInterfaces(context.TODO(), input)
+	// get all open network interfaces for all regions
+	vulnNIs := []networkinterface.VulnNI{}
+
+	// Iterate over regions
+	wg := sync.WaitGroup{}
+	mu := sync.Mutex{}
+	for _, region := range regions {
+		wg.Add(1)
+
+		go func(region string) {
+			defer wg.Done()
+
+			// acquire lock to avoid race conditions
+			mu.Lock()
+
+			// add open network interfaces to vulnNIs and release lock
+			vulnNIs = append(vulnNIs, networkinterface.GetOpenNetworkInterfacesForRegion(region)...)
+			mu.Unlock()
+
+			log.Printf("Scanned region: %s\n", region)
+
+		}(region)
+	}
+	wg.Wait()
+
+	// Get Filter bypass IPs
+	bypassIps, err := utils.ReadFileLines(bypassFilePath)
 	if err != nil {
-		log.Fatalf("unable to describe network interfaces, %v", err)
+		log.Fatalf("Error reading bypass file: %v", err)
+	} else {
+		vulnNIs = networkinterface.FilterOpenNetworkInterfaces(vulnNIs, bypassIps)
 	}
 
-	// Filter and display the results
-	for _, ni := range result.NetworkInterfaces {
-		if ni.Association != nil && ni.Association.PublicIp != nil {
+	for _, vulnNI := range vulnNIs {
+		log.Println("*** Vulnerable Network Interface ***")
+		log.Printf("Resource Id: %s", vulnNI.ResourceId)
+		log.Printf("Public IP: %s", vulnNI.PublicIp)
+		log.Printf("Availability Zone: %s", vulnNI.AvailabilityZone)
+		log.Println()
 
-			// Collect security group IDs
-			var sgIds []string
-			for _, sg := range ni.Groups {
-				sgIds = append(sgIds, aws.ToString(sg.GroupId))
+		for _, vulnNISG := range vulnNI.VulnNISGs {
+			log.Println("====== Vulnerable Security Group ======")
+			log.Printf("Security Group ID: %s", vulnNISG.GroupId)
+			log.Printf("Security Group VPC ID: %s", vulnNISG.VpcId)
+			for _, vulnSGConfig := range vulnNISG.VulnConfigs {
+				log.Printf("Port: %d\n", vulnSGConfig.Port)
+				log.Printf("CIDR: %s\n", vulnSGConfig.Cidr)
+				log.Printf("Protocol: %s\n", vulnSGConfig.Protocol)
+				log.Println("-------------------------------------")
 			}
-
-			if len(sgIds) <= 0 {
-				return
-			}
-
-			// Describe the security groups
-			sgOutputs := networkinterface.DescribeSecurityGroups(svc, sgIds)
-			isVulnSg, vulnSGs := networkinterface.GetOpenNetworkInterfaces(sgOutputs)
-
-			if isVulnSg {
-				fmt.Printf("ResourceId: %s\n", aws.ToString(ni.NetworkInterfaceId))
-				fmt.Printf("ResourceType: AWS::EC2::NetworkInterface\n")
-				fmt.Printf("PublicIp: %s\n", aws.ToString(ni.Association.PublicIp))
-				fmt.Printf("AvailabilityZone: %s\n", aws.ToString(ni.AvailabilityZone))
-				fmt.Printf("AWSRegion: %s\n", cfg.Region)
-				fmt.Println()
-				fmt.Println("Vulnerable Security Groups:")
-				fmt.Println(vulnSGs)
-				fmt.Println()
-				fmt.Println("--------------------------------------------------")
-			}
+			log.Println("=====================================")
+			log.Println()
 		}
+	}
+
+	// Send notification
+	if sendNotification {
+		notif.SendNetworkInterfaceNotification(slackWebhook, vulnNIs)
 	}
 }

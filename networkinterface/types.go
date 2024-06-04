@@ -14,3 +14,10 @@ type VulnSGConfig struct {
 	Protocol string
 	IsV6     bool
 }
+
+type VulnNI struct {
+	ResourceId       string
+	PublicIp         string
+	AvailabilityZone string
+	VulnNISGs        []VulnNISG
+}
